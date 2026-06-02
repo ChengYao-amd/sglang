@@ -49,12 +49,17 @@ from torch import nn
 
 from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
+    moe_expert_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_reduce,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -201,10 +206,14 @@ class CCA(nn.Module):
         self.padding1 = self.cca_time1 - 1
         self.total_padding = self.padding0 + self.padding1
 
+        # CCA is head-parallel over the *attention* TP group. That group equals
+        # the global TP group unless DP attention is enabled, in which case it is
+        # the per-DP-replica sub-group (tp_size / dp_size). Tests pass explicit
+        # tp_rank/tp_size; production leaves them None and resolves here.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_attention_tp_rank()
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_attention_tp_size()
         self.tp_rank = int(tp_rank)
         self.tp_size = int(tp_size)
 
@@ -833,30 +842,29 @@ class ZayaAttention(nn.Module):
         # divisible by tp_size; the KV-replicated GQA-TP variant (tp_size >
         # num_k_heads) is intentionally rejected with a clear error message
         # because both per-K-head paths assume each rank holds whole K heads.
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        # The head split, the ``o_proj`` RowParallel all-reduce, and the
-        # RadixAttention KV cache are all organized on the *global* TP group,
-        # and ``ZayaConfig.mamba2_cache_params`` sizes the conv-state cache on
-        # that same group. DP attention would run attention on the smaller
-        # attention-TP group (and ``o_proj`` would need
-        # ``use_dp_attention_reduce``), which this model does not wire up, so
-        # require the two groups to coincide and fail fast instead of silently
-        # mis-sizing the conv-state cache.
-        attn_tp_size = get_attention_tp_size()
-        assert attn_tp_size == self.tp_size, (
-            f"ZAYA1 head-parallel attention requires the attention TP group "
-            f"({attn_tp_size}) to equal the global TP group ({self.tp_size}); "
-            "DP attention (enable_dp_attention) is not supported for ZAYA1."
-        )
+        # Head-parallel attention runs on the *attention* TP group. With plain
+        # tensor parallelism this is the global TP group; with DP attention
+        # (``enable_dp_attention``) it is the per-DP-replica sub-group of size
+        # ``tp_size / dp_size``. CCA, ``o_proj`` and ``ZayaConfig.
+        # mamba2_cache_params`` are all organized on this same group, so they
+        # stay consistent in either mode.
+        self.tp_rank = get_attention_tp_rank()
+        self.tp_size = get_attention_tp_size()
         assert self.num_q_heads_full % self.tp_size == 0, (
             f"num_attention_heads ({self.num_q_heads_full}) must be divisible "
-            f"by tp_size ({self.tp_size}) for ZAYA1 head-parallel attention"
+            f"by attention tp_size ({self.tp_size}) for ZAYA1 head-parallel "
+            "attention"
         )
+        # ZAYA1's grouped-mean and ``conv_qk.1`` keep whole GQA groups on each
+        # rank, so attention TP cannot exceed ``num_query_groups`` (KV-head
+        # replication would need a cross-rank reduction inside CCA). To use more
+        # GPUs than that, enable DP attention so the extra ranks form additional
+        # data-parallel replicas while attention TP stays <= num_query_groups.
         assert self.num_k_heads_full % self.tp_size == 0, (
             f"num_query_groups ({self.num_k_heads_full}) must be divisible by "
-            f"tp_size ({self.tp_size}); set tp_size <= num_k_heads to keep "
-            "both grouped-mean and conv_qk.1 head-local on each rank"
+            f"attention tp_size ({self.tp_size}); attention TP cannot exceed "
+            "num_query_groups for ZAYA1. Enable DP attention "
+            "(enable_dp_attention) to scale across the remaining GPUs."
         )
         self.num_q_heads = self.num_q_heads_full // self.tp_size
         self.num_k_heads = self.num_k_heads_full // self.tp_size
@@ -881,37 +889,57 @@ class ZayaAttention(nn.Module):
             tp_size=self.tp_size,
         )
 
-        # RowParallel o_proj: per-rank input is the rank's q heads, full
-        # output is replicated via the end-of-forward all-reduce.
+        # RowParallel o_proj on the attention-TP group: per-rank input is the
+        # rank's q heads. The cross-rank reduction is deferred to ``forward``
+        # via ``attn_tp_all_reduce`` so it targets the attention-TP group rather
+        # than the global TP group (the two coincide when DP attention is off).
         self.o_proj = RowParallelLinear(
             self.q_dim_full,
             self.hidden_size,
             bias=bool(getattr(config, "attention_bias", False)),
             input_is_parallel=True,
-            reduce_results=True,
+            reduce_results=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
         )
 
+        # ZAYA1-74B interleaves sliding-window attention with full attention
+        # (per-layer ``swa_layers``), and the sliding layers use their own RoPE
+        # base (``swa_rotary_base``) instead of ``rope_theta``. Base checkpoints
+        # have ``swa_layers = None`` and always take the full-attention path.
+        swa_window = config.sliding_window_for_layer(layer_id)
+        self.is_sliding = swa_window > 0
         rope_theta = float(getattr(config, "rope_theta", 1_000_000.0))
+        if self.is_sliding:
+            swa_rotary_base = getattr(config, "swa_rotary_base", None)
+            rope_base = float(swa_rotary_base) if swa_rotary_base else rope_theta
+        else:
+            rope_base = rope_theta
         partial_rotary_factor = float(getattr(config, "partial_rotary_factor", 0.5))
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=int(config.max_position_embeddings),
-            base=int(rope_theta),
+            base=int(rope_base),
             is_neox_style=True,
             partial_rotary_factor=partial_rotary_factor,
         )
 
+        # Store ``window - 1`` (exclusive boundary -- the convention the SGLang
+        # attention backends expect via ``layer.sliding_window_size``); full
+        # attention layers pass -1. The backends pick the window per layer from
+        # this attribute, and ``ModelRunner`` learns the global window from
+        # ``ZayaForCausalLM.get_attention_sliding_window_size``.
+        self.sliding_window_size = (swa_window - 1) if self.is_sliding else -1
         self.attn = RadixAttention(
             num_heads=self.num_q_heads,
             head_dim=self.head_dim,
             scaling=self.scale,
             num_kv_heads=self.num_k_heads,
             layer_id=layer_id,
+            sliding_window_size=self.sliding_window_size,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
@@ -940,6 +968,11 @@ class ZayaAttention(nn.Module):
         v = v.contiguous()
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
+        # o_proj is RowParallel with ``reduce_results=False``; reduce the partial
+        # sums across the attention-TP group (equals the global TP group unless
+        # DP attention is enabled). A size-1 group makes this a no-op.
+        if self.tp_size > 1:
+            output = attn_tp_all_reduce(output)
         return output
 
 
@@ -1143,10 +1176,16 @@ class ZayaBlock(nn.Module):
         self.mlp_expansion = int(config.zaya_mlp_expansion)
         self.topk = int(getattr(config, "moe_router_topk", 1))
 
-        self.tp_size = get_tensor_model_parallel_world_size()
+        # Reduce over the *MoE* parallel groups (not the global TP group) so the
+        # block is correct under expert parallelism (EP) and DP attention, where
+        # the experts are sharded across the EP group and/or each DP replica owns
+        # a different token slice. Under plain TP, ``moe_tp == global_tp`` and
+        # ``ep == 1``, so this is behaviour-preserving.
+        self.tp_size = get_moe_tensor_parallel_world_size()
+        self.ep_size = get_moe_expert_parallel_world_size()
         if self.tp_size > self.num_moe_experts:
             raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than the "
+                f"MoE tensor parallel size {self.tp_size} is greater than the "
                 f"number of experts {self.num_moe_experts}"
             )
 
@@ -1209,28 +1248,40 @@ class ZayaBlock(nn.Module):
             topk_out = topk_out._replace(topk_ids=clamped_ids)
 
             experts_out = self.experts(hidden_states, topk_out)
-            # ``mod_out`` is computed identically on every TP rank (both
-            # ``hidden_states`` and ``probs`` are replicated). Fold the skip
-            # mask into the per-rank partial experts output *before*
-            # all-reduce so the single reduction yields:
+            # ``mod_out`` is computed identically on every rank that owns this
+            # token (both ``hidden_states`` and ``probs`` are replicated across
+            # the MoE-TP / MoE-EP groups). Fold the skip mask into the per-rank
+            # partial experts output *before* the reduce so the reduction yields:
             #   sum_r(mask · partial_r) + (1 - mask) · mod_out
             # = mask · experts_out_full + (1 - mask) · mod_out
-            # without double-counting ``mod_out`` by tp_size. The two steps are
+            # without double-counting ``mod_out``. The two steps are
             # ``mod_premask_experts`` / ``mod_blend`` so the math is testable
             # without a live distributed group.
             mod_out = hidden_states * probs
             mod_mask, masked_experts = mod_premask_experts(
                 experts_out, indices, self.num_moe_experts
             )
-            if self.tp_size > 1:
-                masked_experts = tensor_model_parallel_all_reduce(masked_experts)
+            masked_experts = self._reduce_experts(masked_experts)
             hidden_out = mod_blend(masked_experts, mod_mask, mod_out)
         else:
-            hidden_out = self.experts(hidden_states, topk_out)
-            if self.tp_size > 1:
-                hidden_out = tensor_model_parallel_all_reduce(hidden_out)
+            hidden_out = self._reduce_experts(self.experts(hidden_states, topk_out))
 
         return hidden_out, router_hs_next
+
+    def _reduce_experts(self, experts_out: torch.Tensor) -> torch.Tensor:
+        """Combine partial expert outputs over the MoE parallel groups.
+
+        Mirrors the canonical SGLang MoE reduce (cf. ``qwen3_moe``): first an
+        all-reduce over the expert-parallel (EP) group, then over the
+        MoE-tensor-parallel (TP) group. Under plain TP this is a single reduce
+        over the global TP group; under EP / DP attention it stays scoped to the
+        MoE groups and never spans the DP-attention replicas.
+        """
+        if self.ep_size > 1:
+            experts_out = moe_expert_parallel_all_reduce(experts_out)
+        if self.tp_size > 1:
+            experts_out = moe_tensor_model_parallel_all_reduce(experts_out)
+        return experts_out
 
 
 # ---------------------------------------------------------------------------
@@ -1515,6 +1566,16 @@ class ZayaForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
+
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        """Global sliding-window size for SWA-enabled checkpoints (else None).
+
+        ``ModelRunner`` calls this to size the attention backend's SWA metadata
+        buffers; returning None on base checkpoints leaves the runtime in the
+        plain full-attention path. The per-layer window is selected inside
+        ``ZayaAttention`` via ``RadixAttention.sliding_window_size``.
+        """
+        return self.config.get_attention_sliding_window_size()
 
     @torch.no_grad()
     def forward(
