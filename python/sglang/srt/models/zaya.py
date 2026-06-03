@@ -52,13 +52,20 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_world_size,
     get_pp_group,
+    get_tp_group,
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
+    dp_gather_partial,
+    dp_scatter,
+    get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_global_dp_buffer,
+    get_local_dp_buffer,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -67,6 +74,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -80,6 +88,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -1397,9 +1406,32 @@ class ZayaDecoderMLPLayer(nn.Module):
         hidden_states = _apply_norm_with_fp32_residual(
             self.input_norm, residual, target_dtype
         )
+        # DP attention: the attention layers kept each DP replica's tokens
+        # local, but the experts (and their EP / MoE-TP all-reduce) must run over
+        # the *full* token set. Gather the DP-local normed hidden states into the
+        # global sequence -- tokens then become replicated across the whole TP
+        # group, which is exactly the layout ``ZayaBlock``'s reduce expects --
+        # run the experts, then scatter the per-token result back to this
+        # replica's slice. The fp32 ``residual`` stays DP-local;
+        # ``prev_router_hidden_states`` stays in the gathered (global) layout and
+        # is threaded through the MoE layers (every gather uses the same global
+        # token order, so router state and hidden states stay aligned).
+        use_dp_gather = get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none()
+        if use_dp_gather:
+            hidden_states, local_hidden_states = (
+                get_global_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
+            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         hidden_states, prev_router_hidden_states = self.zaya_block(
             hidden_states, prev_router_hidden_states
         )
+        if use_dp_gather:
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
         return hidden_states, residual, prev_router_hidden_states
 
 
@@ -1446,10 +1478,18 @@ class ZayaModel(nn.Module):
         self.pp_group = get_pp_group()
 
         if self.pp_group.is_first_rank:
+            # Under DP attention each replica embeds its own DP-local token slice,
+            # so the vocab is sharded over the *attention* TP sub-group (and
+            # replicated across DP replicas) via ``use_attn_tp_group``. Sharding
+            # over the global TP group instead would make the embedding reduce
+            # span DP ranks and sum embeddings of unrelated tokens. With DP
+            # attention off, ``use_attn_tp_group`` is False and this is the plain
+            # global-TP vocab-parallel path.
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -1552,16 +1592,31 @@ class ZayaForCausalLM(nn.Module):
         )
 
         if self.pp_group.is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                bias=bool(getattr(config, "lm_head_bias", False)),
-                quant_config=None,
-                prefix=add_prefix("lm_head", prefix),
-            )
-            if config.tie_word_embeddings:
-                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+            lm_head_bias = bool(getattr(config, "lm_head_bias", False))
+            if (
+                config.tie_word_embeddings
+                and self.pp_group.world_size == 1
+                and not lm_head_bias
+            ):
+                # Reuse the embedding module so the tied head inherits both the
+                # weights *and* the vocab-shard group (global TP, or attention TP
+                # under DP attention). Keeping the shard group identical is what
+                # lets the LogitsProcessor gather/scatter line up with the
+                # lm_head layout; allocating a separate ParallelLMHead with a
+                # different ``use_attn_tp_group`` would mismatch it under DP.
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    org_num_embeddings=config.vocab_size,
+                    bias=lm_head_bias,
+                    quant_config=None,
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    prefix=add_prefix("lm_head", prefix),
+                )
+                if config.tie_word_embeddings:
+                    self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:
             self.lm_head = PPMissingLayer()
 
