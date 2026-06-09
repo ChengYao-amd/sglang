@@ -58,7 +58,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    dp_gather_partial,
+    dp_gather_replicate,
     dp_scatter,
     get_attention_dp_size,
     get_attention_tp_rank,
@@ -964,9 +964,14 @@ class ZayaAttention(nn.Module):
         # rotary + RadixAttention.
         q, k, v = self.qkv(hidden_states, forward_batch)
         target_dtype = hidden_states.dtype
-        q = q.reshape(q.shape[0], -1).to(target_dtype)
-        k = k.reshape(k.shape[0], -1).to(target_dtype)
-        v = v.reshape(v.shape[0], -1).to(target_dtype)
+        # ``flatten(1)`` rather than ``reshape(T, -1)``: under DP attention a
+        # replica with no requests this step runs an idle forward with T=0, and
+        # ``reshape(0, -1)`` raises (the ``-1`` is ambiguous for a 0-element
+        # tensor). ``flatten`` multiplies the head dims explicitly, so it yields
+        # ``[0, heads*head_dim]`` and is identical to the old reshape for T>0.
+        q = q.flatten(1).to(target_dtype)
+        k = k.flatten(1).to(target_dtype)
+        v = v.flatten(1).to(target_dtype)
 
         q, k = self.rotary_emb(positions, q, k)
         # Some rotary backends (notably AITER on ROCm) hand back tensors with
@@ -1416,13 +1421,22 @@ class ZayaDecoderMLPLayer(nn.Module):
         # ``prev_router_hidden_states`` stays in the gathered (global) layout and
         # is threaded through the MoE layers (every gather uses the same global
         # token order, so router state and hidden states stay aligned).
+        #
+        # Use the *replicate* gather (not ``dp_gather_partial``): ``self_attn``
+        # already ran ``attn_tp_all_reduce``, so within each DP replica the normed
+        # hidden states are identical across the attention-TP ranks. The replicate
+        # gather takes each replica's slice from its attn-TP rank 0 only; the
+        # partial gather instead sums every attn-TP rank into the same slot, which
+        # multiplies the tokens by ``attn_tp_size`` -- a no-op at attn_tp=1 (so
+        # tp=2/dp=2 was correct) but corrupting every value once attn_tp>1 (e.g.
+        # tp=4/dp=2 on 74B doubled them, producing garbage output).
         use_dp_gather = get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none()
         if use_dp_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         hidden_states, prev_router_hidden_states = self.zaya_block(
             hidden_states, prev_router_hidden_states
         )
